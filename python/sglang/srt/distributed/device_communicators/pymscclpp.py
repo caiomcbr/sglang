@@ -2,26 +2,22 @@ import bisect
 import logging
 import math
 import os
+import ipaddress
+import netifaces as ni
 from contextlib import contextmanager
 from enum import IntEnum
 from typing import Optional, Union
+
+import mscclpp.comm as mscclpp_comm
+import mscclpp
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
-from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
-
-
-class MscclContextSelection(IntEnum):
-    MSCCL1SHOT1NODELL = 1
-    MSCCL1SHOT2NODELL = 2
-
 
 def mscclpp_is_weak_contiguous(inp: torch.Tensor):
     return inp.is_contiguous() or (
@@ -71,38 +67,37 @@ def mscclpp_convert_to_bytes(size_str):
         raise ValueError(f"Unsupported unit: {unit}, support B, KB, MB, GB only")
 
 
-def mscclpp_bench_time(func, test_niter: int = 10, warmup_niter: int = 2):
-    # warmup
-    for _ in range(warmup_niter):
-        func()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    dist.barrier()
-    start_event.record()
-    for _ in range(test_niter):
-        func()
-    end_event.record()
-    end_event.synchronize()
-    func_cost_us = start_event.elapsed_time(end_event) / test_niter * 1000
-    return func_cost_us
-
-
 class PyMscclppCommunicator:
     _SUPPORTED_WORLD_SIZES = [8, 16]
     _MAX_BYTES = mscclpp_convert_to_bytes(os.getenv("SGLANG_MSCCLPP_MAX_BYTES", "1MB"))
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
 
-    # max_bytes: max supported mscclpp allreduce size
-    # in A100 mscclpp is faster than nccl only under condition of msg size smaller than1MB
+    def interfaces_for_ip_netifaces(self, ip: str):
+        target = ipaddress.ip_address(ip)
+        for interface in ni.interfaces():
+            addresses = ni.ifaddresses(interface)
+            if ni.AF_INET in addresses:
+                for link in addresses[ni.AF_INET]:
+                    if "addr" in link:
+                        addr = ipaddress.ip_address(link["addr"])
+                        if addr == target:
+                            return interface
+        return None
+
+    def load_algorithms(self, scratch_buffer: torch.tensor, rank: int):
+        collection_builder = mscclpp.AlgorithmCollectionBuilder()
+        return collection_builder.build_default_algorithms(
+            scratch_buffer=scratch_buffer.data_ptr(), scratch_buffer_size=scratch_buffer.nbytes, rank=rank
+        )
+
     def __init__(
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
         max_bytes=_MAX_BYTES,
     ) -> None:
-        """
-        Args:
+        
+        """ Args:
             group: the process group to work on. If None, it will use the
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
@@ -141,6 +136,9 @@ class PyMscclppCommunicator:
             )
             return
 
+        master_addr = os.environ["MSCCLPP_MASTER_ADDR"]
+        master_port = os.environ["MSCCLPP_MASTER_PORT"]
+
         self.ranks = torch.distributed.get_process_group_ranks(group)
         self.nranks_per_node = torch.cuda.device_count()
         # for now mscclpp with stride in the communicator is not tested
@@ -165,97 +163,25 @@ class PyMscclppCommunicator:
         self.rank = rank
         self.world_size = world_size
 
-        if dist.get_rank(group) == 0:
-            unique_id = [ops.mscclpp_generate_unique_id()]
-        else:
-            unique_id = [None]
-        dist.broadcast_object_list(unique_id, src=self.ranks[0], group=self.group)
-        self.unique_id = unique_id[0]
-        self.rank_to_node, self.rank_to_ib = list(range(world_size)), list(
-            range(world_size)
-        )
-        for r in range(world_size):
-            self.rank_to_node[r] = r // 8
-            self.rank_to_ib[r] = self.rank % 8
+        interface = self.interfaces_for_ip_netifaces(master_addr)
+        if interface is None:
+            raise ValueError(f"Cannot find network interface for IP address {master_addr}")
+        interfaceIpPortTrio = f"{interface}:{master_addr}:{master_port}"
+        self.comm = mscclpp_comm.CommGroup(interfaceIpPortTrio=interfaceIpPortTrio, rank=rank, size=world_size)
+        self.executor = mscclpp.Executor(self.comm.communicator)
 
-        self._context = None
-        self.context_selection = None
-        self.msg_size_for_finetune = [
-            2**i for i in range(10, math.floor(math.log2(self.max_bytes)) + 1)
-        ]
-        self.msg_size2best_config = {}
-        if world_size == 8:
-            self.context_selection = MscclContextSelection.MSCCL1SHOT1NODELL
-        elif world_size == 16:
-            self.context_selection = MscclContextSelection.MSCCL1SHOT2NODELL
-        if not _is_hip:
-            self.scratch = torch.empty(
-                self.max_bytes * 8,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            self.put_buffer = torch.empty(
-                self.max_bytes * 8 // self.nranks_per_node,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            self._context = ops.mscclpp_init_context(
-                self.unique_id,
-                self.rank,
-                self.world_size,
-                self.scratch,
-                self.put_buffer,
-                self.nranks_per_node,
-                self.rank_to_node,
-                self.rank_to_ib,
-                int(self.context_selection),
-            )
-        else:
-            raise NotImplementedError("HIP Mscclpp is not supported yet.")
-
-        self.msg_size2best_config = {}
-        self.pre_tune_config()
-        if dist.get_rank(group) == 0:
-            msg_size2best_config = [self.msg_size2best_config]
-        else:
-            msg_size2best_config = [None]
-        dist.broadcast_object_list(
-            msg_size2best_config, src=self.ranks[0], group=self.group
-        )
-        self.msg_size2best_config = msg_size2best_config[0]
+        dlpack = mscclpp.RawGpuBuffer(1 << 27).to_dlpack(data_type=str(torch.float16))
+        self.scratch_buffer = torch.utils.dlpack.from_dlpack(dlpack)
+        self.algorithms = self.load_algorithms(scratch_buffer=self.scratch_buffer, rank=self.rank)
 
         # PyMscclpp is enabled only in cuda graph
         self.disabled = True
 
-    def pre_tune_config(self, dtype=torch.bfloat16) -> bool:
-        logger.debug(f"start to pre-tune configs for rank {self.rank}")
-        nthreads_to_try = [256, 512, 1024]
-        nblocks_to_try = [21, 42, 84]
-        inp_randn = torch.ones(
-            self.msg_size_for_finetune[-1] // dtype.itemsize, dtype=dtype, device="cuda"
-        )
-        oup_randn = torch.empty_like(inp_randn)
-        for msg_size in self.msg_size_for_finetune:
-            mock_inp, mock_outp = (
-                inp_randn[: msg_size // dtype.itemsize],
-                oup_randn[: msg_size // dtype.itemsize],
-            )
-            best_config, best_time = None, None
-            for nthreads in nthreads_to_try:
-                for nblocks in nblocks_to_try:
-                    cur_cost = mscclpp_bench_time(
-                        lambda: ops.mscclpp_allreduce(
-                            self._context, mock_inp, mock_outp, nthreads, nblocks
-                        )
-                    )
-                    if best_time is None or cur_cost < best_time:
-                        best_config = (nthreads, nblocks)
-                        best_time = cur_cost
-            self.msg_size2best_config[msg_size] = best_config
-            if self.rank == 0:
-                logger.debug(
-                    f"for msg_size {msg_size}, best_config: {best_config}, best_time: {best_time}us"
-                )
+    def destroy(self):
+        self.algorithms = None
+        self.executor = None
+        self.scratch_buffer = None
+        self.comm = None
 
     def should_mscclpp_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
@@ -273,17 +199,45 @@ class PyMscclppCommunicator:
             return False
         return True
 
+    def dtype_to_mscclpp_dtype(self, dtype: torch.dtype):
+        if dtype == torch.float16:
+            return mscclpp.DataType.float16
+        elif dtype == torch.float32:
+            return mscclpp.DataType.float32
+        elif dtype == torch.int32:
+            return mscclpp.DataType.int32
+        elif dtype == torch.bfloat16:
+            return mscclpp.DataType.bfloat16
+        else:
+            raise ValueError(f"Unknown data type: {dtype}")
+
     def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM):
-        if self._IS_CAPTURING:
-            if torch.cuda.is_current_stream_capturing():
-                self.graph_input_set.add((tensor.dtype, tensor.numel()))
-        msg_size = tensor.numel() * tensor.itemsize
-        index = bisect.bisect_left(self.msg_size_for_finetune, msg_size)
-        msg_size_finetune = self.msg_size_for_finetune[index]
-        nthreads, nblocks = self.msg_size2best_config[msg_size_finetune]
+        assert op == torch.distributed.ReduceOp.SUM
+        algo: mscclpp.Algorithm = self.algorithms[8]
+        current_stream = torch.cuda.current_stream()
         result = torch.empty_like(tensor)
-        ops.mscclpp_allreduce(self._context, tensor, result, nthreads, nblocks)
+        
+        if tensor.nbytes < (1 << 15):
+            algo = self.algorithms[7]
+        else:
+            algo = self.algorithms[4]
+
+        algo.execute(
+            comm=self.comm.communicator,
+            executor=self.executor,
+            input_buffer=tensor.data_ptr(),
+            output_buffer=result.data_ptr(),
+            input_size=tensor.nbytes,
+            output_size=result.nbytes,
+            dtype=self.dtype_to_mscclpp_dtype(tensor.dtype),
+            op=mscclpp.ReduceOp.SUM,
+            stream=current_stream.cuda_stream
+        )
+
         return result
+
+    def barrier_cpu(self):
+        self.comm.barrier()
 
     @contextmanager
     def change_state(
