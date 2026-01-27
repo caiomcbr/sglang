@@ -1,4 +1,5 @@
 import bisect
+import importlib
 import logging
 import math
 import os
@@ -7,9 +8,6 @@ import netifaces as ni
 from contextlib import contextmanager
 from enum import IntEnum
 from typing import Optional, Union
-
-import mscclpp.comm as mscclpp_comm
-import mscclpp
 
 import torch
 import torch.distributed as dist
@@ -84,12 +82,6 @@ class PyMscclppCommunicator:
                             return interface
         return None
 
-    def load_algorithms(self, scratch_buffer: torch.tensor, rank: int):
-        collection_builder = mscclpp.AlgorithmCollectionBuilder()
-        return collection_builder.build_default_algorithms(
-            scratch_buffer=scratch_buffer.data_ptr(), scratch_buffer_size=scratch_buffer.nbytes, rank=rank
-        )
-
     def __init__(
         self,
         group: ProcessGroup,
@@ -109,11 +101,15 @@ class PyMscclppCommunicator:
         self._IS_CAPTURING = False
         self.disabled = True
 
-        if not ops.IS_MSCCLPP_AR_AVAILABLE:
-            # disable because of missing mscclpp library
-            # e.g. in a non-cuda environment
+        try:
+            self.mscclpp = importlib.import_module("mscclpp")
+            self.mscclpp_ext = importlib.import_module("mscclpp.ext")
+        except ImportError:
+            self.available = False
+            self.mscclpp = None
             return
 
+        self.available = True
         self.group = group
 
         assert (
@@ -167,15 +163,14 @@ class PyMscclppCommunicator:
         if interface is None:
             raise ValueError(f"Cannot find network interface for IP address {master_addr}")
         interfaceIpPortTrio = f"{interface}:{master_addr}:{master_port}"
-        self.comm = mscclpp_comm.CommGroup(interfaceIpPortTrio=interfaceIpPortTrio, rank=rank, size=world_size)
-        self.executor = mscclpp.Executor(self.comm.communicator)
+        self.comm = self.mscclpp.CommGroup(interfaceIpPortTrio=interfaceIpPortTrio, rank=rank, size=world_size)
+        self.executor = self.mscclpp.Executor(self.comm.communicator)
 
-        dlpack = mscclpp.RawGpuBuffer(1 << 27).to_dlpack(data_type=str(torch.float16))
+        dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(data_type=str(torch.float16))
         self.scratch_buffer = torch.utils.dlpack.from_dlpack(dlpack)
-        self.algorithms = self.load_algorithms(scratch_buffer=self.scratch_buffer, rank=self.rank)
-
-        # PyMscclpp is enabled only in cuda graph
-        self.disabled = True
+        self.algorithms = self.mscclpp_ext.AlgorithmCollectionBuilder().build_default_algorithms(
+            scratch_buffer=self.scratch_buffer.data_ptr(), scratch_buffer_size=self.scratch_buffer.nbytes, rank=self.rank
+        )
 
     def destroy(self):
         self.algorithms = None
@@ -186,7 +181,7 @@ class PyMscclppCommunicator:
     def should_mscclpp_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
     ) -> bool:
-        if self.disabled or self._context is None:
+        if self.disabled:
             return False
         if inp.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
             return False
@@ -201,26 +196,40 @@ class PyMscclppCommunicator:
 
     def dtype_to_mscclpp_dtype(self, dtype: torch.dtype):
         if dtype == torch.float16:
-            return mscclpp.DataType.float16
+            return self.mscclpp.DataType.float16
         elif dtype == torch.float32:
-            return mscclpp.DataType.float32
+            return self.mscclpp.DataType.float32
         elif dtype == torch.int32:
-            return mscclpp.DataType.int32
+            return self.mscclpp.DataType.int32
         elif dtype == torch.bfloat16:
-            return mscclpp.DataType.bfloat16
+            return self.mscclpp.DataType.bfloat16
         else:
             raise ValueError(f"Unknown data type: {dtype}")
 
     def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM):
         assert op == torch.distributed.ReduceOp.SUM
-        algo: mscclpp.Algorithm = self.algorithms[8]
+        algo = self.algorithms[8]
         current_stream = torch.cuda.current_stream()
         result = torch.empty_like(tensor)
+        nblocks = 0
+        nthreads_per_block = 0
         
-        if tensor.nbytes < (1 << 15):
+        if tensor.nbytes <= (1 << 15):
             algo = self.algorithms[7]
+            if tensor.nbytes <= (1 << 13):
+                nblocks = 32
+                nthreads_per_block = 768
+            else:
+                nblocks = 24
+                nthreads_per_block = 1024
         else:
             algo = self.algorithms[4]
+            if tensor.nbytes <= (1 << 18):
+                nblocks = 42
+                nthreads_per_block = 512
+            elif tensor.nbytes < (1 << 20):
+                nblocks = 56
+                nthreads_per_block = 512
 
         algo.execute(
             comm=self.comm.communicator,
@@ -230,8 +239,10 @@ class PyMscclppCommunicator:
             input_size=tensor.nbytes,
             output_size=result.nbytes,
             dtype=self.dtype_to_mscclpp_dtype(tensor.dtype),
-            op=mscclpp.ReduceOp.SUM,
-            stream=current_stream.cuda_stream
+            op=self.mscclpp.ReduceOp.SUM,
+            stream=current_stream.cuda_stream,
+            nblocks=nblocks,
+            nthreads_per_block=nthreads_per_block
         )
 
         return result
@@ -244,8 +255,9 @@ class PyMscclppCommunicator:
         self,
         enable: Optional[bool] = None,
     ):
-        if enable is None:
+        if enable is None or self.available is False:
             # guess a default value when not specified
+            # DO: Decided if raise an exception here or not
             enable = self.available
 
         old_disable = self.disabled
