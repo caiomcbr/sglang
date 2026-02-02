@@ -71,6 +71,7 @@ class PyMscclppCommunicator:
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
 
     def interfaces_for_ip_netifaces(self, ip: str):
+        """Find local interface that matches the given IP exactly."""
         target = ipaddress.ip_address(ip)
         for interface in ni.interfaces():
             addresses = ni.ifaddresses(interface)
@@ -81,6 +82,209 @@ class PyMscclppCommunicator:
                         if addr == target:
                             return interface
         return None
+
+    def find_interface_in_same_subnet(self, ip: str):
+        """Find a local interface that's in the same subnet as the target IP."""
+        target = ipaddress.ip_address(ip)
+        for interface in ni.interfaces():
+            addresses = ni.ifaddresses(interface)
+            if ni.AF_INET in addresses:
+                for link in addresses[ni.AF_INET]:
+                    if "addr" in link and "netmask" in link:
+                        addr = ipaddress.ip_address(link["addr"])
+                        netmask = link["netmask"]
+                        network = ipaddress.ip_network(f"{link['addr']}/{netmask}", strict=False)
+                        if target in network:
+                            return interface, str(addr)
+        return None, None
+
+    def get_local_interface_and_ip(self, master_addr: str):
+        """
+        Get local interface for multi-node communication.
+        Priority:
+        1. MSCCLPP_INTERFACE env var (explicit override)
+        2. Interface with exact IP match (master node)
+        3. Interface in same subnet as master (worker nodes)
+        """
+        # Allow explicit interface override
+        if "MSCCLPP_INTERFACE" in os.environ:
+            interface = os.environ["MSCCLPP_INTERFACE"]
+            # Get the IP of this interface
+            addresses = ni.ifaddresses(interface)
+            if ni.AF_INET in addresses:
+                local_ip = addresses[ni.AF_INET][0]["addr"]
+                return interface, local_ip
+            raise ValueError(f"Interface {interface} has no IPv4 address")
+
+        # Try exact IP match (for master node)
+        interface = self.interfaces_for_ip_netifaces(master_addr)
+        if interface is not None:
+            return interface, master_addr
+
+        # Find interface in same subnet (for worker nodes)
+        interface, local_ip = self.find_interface_in_same_subnet(master_addr)
+        if interface is not None:
+            return interface, local_ip
+
+        raise ValueError(f"Cannot find network interface for IP address {master_addr}")
+
+    def _creating_dsl_algorithms(self):
+        dsl_algorithms = []
+        if self.world_size//self.nranks_per_node == 1:
+            for tbg in [1, 2, 4, 8]:
+                for num_threads_per_block in [256, 512, 768, 1024]:
+                    spec = self.mscclpp.language.AlgoSpec(
+                        name=f"allreduce_1node_{tbg}TBG_{num_threads_per_block}TPB",
+                        collective=self.mscclpp.language.collectives.AllReduce(16, 1, True),
+                        nranks_per_node=8,
+                        world_size=16,
+                        in_place=True,
+                        instances=1,
+                        protocol="LL",
+                        auto_sync=False,
+                        num_threads_per_block=num_threads_per_block,
+                        reuse_resources=True,
+                        use_double_scratch_buffer=True,
+                        min_message_size=1 << 10,
+                        max_message_size=2 << 20,
+                        tags={"default": 1},
+                    )
+                    algo = self.mscclpp.compile(self.def_algo.allreduce_2nodes, spec, self.rank, thread_block_group_size=tbg)
+                    dsl_algorithms.append(algo)
+        return dsl_algorithms
+
+    def barrier_cpu(self):
+        self.comm.barrier()
+    
+    def _tune(self, n_warmup, n_graph_launches, n_ops_per_graph, algos):
+        sizes = [1 << i for i in range(10, 21)]
+        self.best_configs = {1024: (self._algorithm_nvls_packet, 0, 0)}
+
+        tune_tensor = torch.rand(1 << 27, dtype=torch.float16, device="cuda")
+        candidates_nblocks = [4, 8, 16, 21, 24, 28, 32, 42, 48, 56, 64, 128]
+        candidates_nthreads = [512, 768, 1024]
+
+        for size in sizes:
+            best_time = float("inf")
+            best_config = None
+
+            for algo in algos:
+                if algo.is_native_algorithm():
+                    for nb in candidates_nblocks:
+                        if algo.name == "default_allreduce_nvls_packet" and (nb > 16):
+                            continue
+                        if algo.name == "default_allreduce_packet" and (nb > 56 or nb % 7 != 0):
+                            continue
+                        if algo.name == "default_allreduce_nvls_packet" and algo.name != "default_allreduce_nvls_packet":
+                            continue
+
+                        for nt in candidates_nthreads:
+                            
+                            if self._run_algo(algo, tune_tensor, size, nb, nt) != 0:
+                                continue
+
+                            for _ in range(n_warmup):
+                                self._run_algo(algo, tune_tensor, size, nb, nt)
+                            self.barrier()
+                            capture_stream = torch.cuda.Stream()
+                            capture_stream.wait_stream(torch.cuda.current_stream())
+
+                            g = torch.cuda.CUDAGraph()
+                            # Warmup on capture stream
+                            with torch.cuda.stream(capture_stream):
+                                self._run_algo(algo, tune_tensor, size, nb, nt)
+                            capture_stream.synchronize()
+
+                            with torch.cuda.graph(g, stream=capture_stream):
+                                for _ in range(n_ops_per_graph):
+                                    self._run_algo(algo, tune_tensor, size, nb, nt)
+
+                            start_event = torch.cuda.Event(enable_timing=True)
+                            end_event = torch.cuda.Event(enable_timing=True)
+                            start_event.record(capture_stream)
+                            with torch.cuda.stream(capture_stream):
+                                for _ in range(n_graph_launches):
+                                    g.replay()
+                            end_event.record(capture_stream)
+                            end_event.synchronize()
+
+                            elapsed = start_event.elapsed_time(end_event)
+
+                            # Synchronize timing results across all ranks to ensure consistent algorithm selection
+                            # replicate n times such due to algo limitations
+                            time_tensor = torch.full((self.world_size,), elapsed, dtype=torch.float64, device="cuda").to(
+                                dtype=torch.float32
+                            )
+                            torch.cuda.current_stream().wait_stream(capture_stream)
+                            self.all_reduce(time_tensor, op=torch.distributed.ReduceOp.SUM)
+                            avg_time = time_tensor[self.rank].item() / self.world_size
+
+                            if avg_time < best_time:
+                                best_time = avg_time
+                                best_config = (algo, nb, nt)
+                else:
+                    if self._run_algo(algo, tune_tensor, size, 0, 0) != 0:
+                        continue
+
+                    for _ in range(n_warmup):
+                        self._run_algo(algo, tune_tensor, size, 0, 0)
+                    self.barrier()
+                    capture_stream = torch.cuda.Stream()
+                    capture_stream.wait_stream(torch.cuda.current_stream())
+
+                    g = torch.cuda.CUDAGraph()
+                    # Warmup on capture stream
+                    with torch.cuda.stream(capture_stream):
+                        self._run_algo(algo, tune_tensor, size, 0, 0)
+                    capture_stream.synchronize()
+
+                    with torch.cuda.graph(g, stream=capture_stream):
+                        for _ in range(n_ops_per_graph):
+                            self._run_algo(algo, tune_tensor, size, 0, 0)
+
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record(capture_stream)
+                    with torch.cuda.stream(capture_stream):
+                        for _ in range(n_graph_launches):
+                            g.replay()
+                    end_event.record(capture_stream)
+                    end_event.synchronize()
+
+                    elapsed = start_event.elapsed_time(end_event)
+
+                    # Synchronize timing results across all ranks to ensure consistent algorithm selection
+                    # replicate n times such due to algo limitations
+                    time_tensor = torch.full((self.world_size,), elapsed, dtype=torch.float64, device="cuda").to(
+                        dtype=torch.float32
+                    )
+                    torch.cuda.current_stream().wait_stream(capture_stream)
+                    self.all_reduce(time_tensor, op=torch.distributed.ReduceOp.SUM)
+                    avg_time = time_tensor[self.rank].item() / self.world_size
+
+                    if avg_time < best_time:
+                        best_time = avg_time
+                        best_config = (algo, nb, nt)
+
+
+            if best_config:
+                self.best_configs[size] = best_config
+
+        torch.cuda.synchronize()
+
+    def _run_algo(self, algo, tensor, size, nblocks, nthreads):
+        return algo.execute(
+            comm=self.comm.communicator,
+            input_buffer=tensor.data_ptr(),
+            output_buffer=tensor.data_ptr(),
+            input_size=size,
+            output_size=size,
+            dtype=self.dtype_to_mscclpp_dtype(tensor.dtype),
+            op=self.mscclpp.ReduceOp.SUM,
+            stream=torch.cuda.current_stream().cuda_stream,
+            nblocks=nblocks,
+            nthreads_per_block=nthreads,
+        )
 
     def __init__(
         self,
@@ -104,6 +308,7 @@ class PyMscclppCommunicator:
         try:
             self.mscclpp = importlib.import_module("mscclpp")
             self.mscclpp_ext = importlib.import_module("mscclpp.ext")
+            self.def_algo = importlib.import_module("mscclpp.default_algos")
         except ImportError:
             self.available = False
             self.mscclpp = None
@@ -159,18 +364,28 @@ class PyMscclppCommunicator:
         self.rank = rank
         self.world_size = world_size
 
-        interface = self.interfaces_for_ip_netifaces(master_addr)
-        if interface is None:
-            raise ValueError(f"Cannot find network interface for IP address {master_addr}")
+        interface, local_ip = self.get_local_interface_and_ip(master_addr)
         interfaceIpPortTrio = f"{interface}:{master_addr}:{master_port}"
         self.comm = self.mscclpp.CommGroup(interfaceIpPortTrio=interfaceIpPortTrio, rank=rank, size=world_size)
         self.executor = self.mscclpp.Executor(self.comm.communicator)
 
+        self.dsl_algos =  self._creating_dsl_algorithms()
         dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(data_type=str(torch.float16))
         self.scratch_buffer = torch.utils.dlpack.from_dlpack(dlpack)
         self.algorithms = self.mscclpp_ext.AlgorithmCollectionBuilder().build_default_algorithms(
             scratch_buffer=self.scratch_buffer.data_ptr(), scratch_buffer_size=self.scratch_buffer.nbytes, rank=self.rank
         )
+        self._algorithm_nvls_packet = [
+            algo
+            for algo in self.algorithms
+            if algo.collective == "allreduce" and algo.name == "default_allreduce_packet"
+        ][0]
+        self.best_configs = {}
+        
+        if world_size == 8:
+            self._tune(5, 10, 20, self.algorithms)
+        elif world_size == 16:
+            self._tune(5, 10, 20, self.dsl_algos)
 
     def destroy(self):
         self.algorithms = None
@@ -206,32 +421,21 @@ class PyMscclppCommunicator:
         else:
             raise ValueError(f"Unknown data type: {dtype}")
 
-    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM):
-        assert op == torch.distributed.ReduceOp.SUM
-        algo = self.algorithms[8]
-        current_stream = torch.cuda.current_stream()
-        result = torch.empty_like(tensor)
-        nblocks = 0
-        nthreads_per_block = 0
-        
-        if tensor.nbytes <= (1 << 15):
-            algo = self.algorithms[7]
-            if tensor.nbytes <= (1 << 13):
-                nblocks = 32
-                nthreads_per_block = 768
-            else:
-                nblocks = 24
-                nthreads_per_block = 1024
+    def get_tuned_config(self, size):
+        if size <= 1024:
+            target_size = 1024
+        elif size > 256 * 1024 * 1024:
+            target_size = 256 * 1024 * 1024
         else:
-            algo = self.algorithms[4]
-            if tensor.nbytes <= (1 << 18):
-                nblocks = 42
-                nthreads_per_block = 512
-            elif tensor.nbytes < (1 << 20):
-                nblocks = 56
-                nthreads_per_block = 512
+            target_size = 1 << (size - 1).bit_length()
+        return self.best_configs.get(target_size)
 
-        algo.execute(
+    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream: torch.cuda.Stream = None):
+        assert op == torch.distributed.ReduceOp.SUM
+        algo, nblocks, nthreads = self.get_tuned_config(tensor.nbytes)
+        result = torch.empty_like(tensor)
+        
+        if algo.execute(
             comm=self.comm.communicator,
             executor=self.executor,
             input_buffer=tensor.data_ptr(),
@@ -240,15 +444,17 @@ class PyMscclppCommunicator:
             output_size=result.nbytes,
             dtype=self.dtype_to_mscclpp_dtype(tensor.dtype),
             op=self.mscclpp.ReduceOp.SUM,
-            stream=current_stream.cuda_stream,
+            stream=stream.cuda_stream if stream is not None else torch.cuda.current_stream().cuda_stream,
             nblocks=nblocks,
-            nthreads_per_block=nthreads_per_block
-        )
+            nthreads_per_block=nthreads,
+        ) != 0:
+            raise RuntimeError("MSCClpp all_reduce failed")
 
         return result
 
-    def barrier_cpu(self):
-        self.comm.barrier()
+    def barrier(self):
+        tensor = torch.empty(self.world_size, dtype=torch.float, device=torch.device("cuda"))
+        self.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
 
     @contextmanager
     def change_state(
