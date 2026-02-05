@@ -56,7 +56,7 @@ class PyMscclppCommunicator:
                         num_threads_per_block=num_threads_per_block,
                         reuse_resources=True,
                         use_double_scratch_buffer=True,
-                        min_message_size=1 << 10,
+                        min_message_size=tbg * (1 << 10),
                         max_message_size=2 << 20,
                         tags={"default": 1},
                     )
