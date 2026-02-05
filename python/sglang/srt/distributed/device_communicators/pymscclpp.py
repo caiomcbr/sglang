@@ -17,6 +17,7 @@ import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 
 logger = logging.getLogger(__name__)
 
+
 class PyMscclppCommunicator:
     _SUPPORTED_WORLD_SIZES = [8, 16]
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
@@ -43,7 +44,9 @@ class PyMscclppCommunicator:
                 for num_threads_per_block in [256, 512, 768, 1024]:
                     spec = self.mscclpp.language.AlgoSpec(
                         name=f"allreduce_1node_{tbg}TBG_{num_threads_per_block}TPB",
-                        collective=self.mscclpp.language.collectives.AllReduce(16, 1, True),
+                        collective=self.mscclpp.language.collectives.AllReduce(
+                            16, 1, True
+                        ),
                         nranks_per_node=8,
                         world_size=16,
                         in_place=True,
@@ -57,25 +60,40 @@ class PyMscclppCommunicator:
                         max_message_size=2 << 20,
                         tags={"default": 1},
                     )
-                    algo = self.mscclpp.compile(self.def_algo.allreduce_2nodes, spec, self.rank, thread_block_group_size=tbg)
+                    algo = self.mscclpp.compile(
+                        self.def_algo.allreduce_2nodes,
+                        spec,
+                        self.rank,
+                        thread_block_group_size=tbg,
+                    )
                     dsl_algos_config.append((algo, [0], [0]))
         return dsl_algos_config
 
     def _create_native_algorithms(self):
         navitve_algorithms_config = []
-        dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(data_type=str(torch.float16))
+        dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(
+            data_type=str(torch.float16)
+        )
         self.scratch_buffer = torch.utils.dlpack.from_dlpack(dlpack)
         self.flag_buffer = torch.ones(128, dtype=torch.uint32, device="cuda")
         algos = self.mscclpp_ext.AlgorithmCollectionBuilder().build_default_algorithms(
-            scratch_buffer=self.scratch_buffer.data_ptr(), flag_buffer=self.flag_buffer.data_ptr(), flag_buffer_size=self.flag_buffer.nbytes, scratch_buffer_size=self.scratch_buffer.nbytes, rank=self.rank
+            scratch_buffer=self.scratch_buffer.data_ptr(),
+            flag_buffer=self.flag_buffer.data_ptr(),
+            flag_buffer_size=self.flag_buffer.nbytes,
+            scratch_buffer_size=self.scratch_buffer.nbytes,
+            rank=self.rank,
         )
 
         for algo in algos:
             if algo.name == "default_allreduce_nvls_packet":
-                navitve_algorithms_config.append((algo, [4, 8, 12, 16], [256, 512, 768, 1024]))
+                navitve_algorithms_config.append(
+                    (algo, [4, 8, 12, 16], [256, 512, 768, 1024])
+                )
             if algo.name == "default_allreduce_packet":
-                navitve_algorithms_config.append((algo, [14, 21, 28, 42, 56], [256, 512, 768,1024]))
-        
+                navitve_algorithms_config.append(
+                    (algo, [14, 21, 28, 42, 56], [256, 512, 768, 1024])
+                )
+
         return navitve_algorithms_config
 
     def _create_algorithms(self):
@@ -83,10 +101,20 @@ class PyMscclppCommunicator:
             self.algos_config = self._create_native_algorithms()
             self._tune(5, 10, 20, self.algos_config)
         elif self.world_size == 16:
-            self.dsl_algos_config =  self._create_dsl_algorithms()
+            self.dsl_algos_config = self._create_dsl_algorithms()
             self._tune(5, 10, 20, self.dsl_algos_config)
 
-    def _get_time(self, algo, tune_tensor, size, nb, nt, n_warmup, n_graph_launches, n_ops_per_graph):
+    def _get_time(
+        self,
+        algo,
+        tune_tensor,
+        size,
+        nb,
+        nt,
+        n_warmup,
+        n_graph_launches,
+        n_ops_per_graph,
+    ):
         # Check if the algorithm can run with the given configuration
         if self._run_algo(algo, tune_tensor, size, nb, nt) != 0:
             return float("inf")
@@ -94,7 +122,7 @@ class PyMscclppCommunicator:
         # Warmup iterations to stabilize performance
         for _ in range(n_warmup):
             self._run_algo(algo, tune_tensor, size, nb, nt)
-        
+
         # Warmup on capture stream
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
@@ -121,9 +149,9 @@ class PyMscclppCommunicator:
 
         # Synchronize timing results across all ranks to ensure consistent algorithm selection
         # replicate n times such due to algo limitations
-        time_tensor = torch.full((self.world_size,), elapsed, dtype=torch.float64, device="cuda").to(
-            dtype=torch.float32
-        )
+        time_tensor = torch.full(
+            (self.world_size,), elapsed, dtype=torch.float64, device="cuda"
+        ).to(dtype=torch.float32)
         torch.cuda.current_stream().wait_stream(capture_stream)
         if self.rank == 0:
             avg_time = time_tensor[self.rank].item() / self.world_size
@@ -137,7 +165,9 @@ class PyMscclppCommunicator:
 
     def _tune(self, n_warmup, n_graph_launches, n_ops_per_graph, algos_config):
         sizes = [1 << i for i in range(9, 22)]
-        dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(data_type=str(torch.float16))
+        dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(
+            data_type=str(torch.float16)
+        )
         tune_tensor = torch.utils.dlpack.from_dlpack(dlpack)
 
         for size in sizes:
@@ -145,10 +175,22 @@ class PyMscclppCommunicator:
             best_config = None
             for i in range(len(algos_config)):
                 algo, candidates_nblocks, candidates_nthreads = algos_config[i]
-                if size >= algo.message_size_range[0] and size <= algo.message_size_range[1]:
+                if (
+                    size >= algo.message_size_range[0]
+                    and size <= algo.message_size_range[1]
+                ):
                     for nb in candidates_nblocks:
                         for nt in candidates_nthreads:
-                            avg_time = self._get_time(algo, tune_tensor, size, nb, nt, n_warmup, n_graph_launches, n_ops_per_graph)
+                            avg_time = self._get_time(
+                                algo,
+                                tune_tensor,
+                                size,
+                                nb,
+                                nt,
+                                n_warmup,
+                                n_graph_launches,
+                                n_ops_per_graph,
+                            )
                             if avg_time < best_time:
                                 best_time = avg_time
                                 best_config = (algo, nb, nt)
@@ -179,8 +221,7 @@ class PyMscclppCommunicator:
         group: ProcessGroup,
         device: Union[int, str, torch.device],
     ) -> None:
-        
-        """ Args:
+        """Args:
             group: the process group to work on. If None, it will use the
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
@@ -246,7 +287,9 @@ class PyMscclppCommunicator:
 
         self.rank = rank
         self.world_size = world_size
-        self.comm = self.mscclpp.CommGroup(torch_group=self.group, rank=rank, size=world_size)
+        self.comm = self.mscclpp.CommGroup(
+            torch_group=self.group, rank=rank, size=world_size
+        )
         self.executor = self.mscclpp.Executor(self.comm.communicator)
         self.best_configs = {}
         self._create_algorithms()
@@ -261,7 +304,10 @@ class PyMscclppCommunicator:
     def should_mscclpp_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
     ) -> bool:
-        if self.disabled or self.world_size not in PyMscclppCommunicator._SUPPORTED_WORLD_SIZES:
+        if (
+            self.disabled
+            or self.world_size not in PyMscclppCommunicator._SUPPORTED_WORLD_SIZES
+        ):
             return False
         if inp.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
             return False
@@ -285,7 +331,12 @@ class PyMscclppCommunicator:
         else:
             raise ValueError(f"Unknown data type: {dtype}")
 
-    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream: torch.cuda.Stream = None):
+    def all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+        stream: torch.cuda.Stream = None,
+    ):
         assert op == torch.distributed.ReduceOp.SUM
         algo, nblocks, nthreads = self._get_tuned_config(tensor.nbytes)
         self._run_algo(algo, tensor, tensor.nbytes, nblocks, nthreads)
