@@ -338,8 +338,9 @@ class PyMscclppCommunicator:
         stream: torch.cuda.Stream = None,
     ):
         assert op == torch.distributed.ReduceOp.SUM
-        algo, nblocks, nthreads = self._get_tuned_config(tensor.nbytes)
-        self._run_algo(algo, tensor, tensor.nbytes, nblocks, nthreads)
+        nbytes = tensor.numel() * tensor.element_size()
+        algo, nblocks, nthreads = self._get_tuned_config(nbytes)
+        self._run_algo(algo, tensor, nbytes, nblocks, nthreads)
         return tensor
 
     @contextmanager
