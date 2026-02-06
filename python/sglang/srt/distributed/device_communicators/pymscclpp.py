@@ -285,7 +285,6 @@ class PyMscclppCommunicator:
         assert isinstance(device, torch.device)
         self.device = device
 
-        self.disabled = False
         self.rank = rank
         self.world_size = world_size
         self.comm = self.mscclpp.CommGroup(
