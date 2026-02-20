@@ -78,8 +78,6 @@ class PyMscclppCommunicator:
         self.flag_buffer = torch.ones(128, dtype=torch.uint32, device="cuda")
         algos = self.mscclpp_ext.AlgorithmCollectionBuilder().build_default_algorithms(
             scratch_buffer=self.scratch_buffer.data_ptr(),
-            flag_buffer=self.flag_buffer.data_ptr(),
-            flag_buffer_size=self.flag_buffer.nbytes,
             scratch_buffer_size=self.scratch_buffer.nbytes,
             rank=self.rank,
         )
