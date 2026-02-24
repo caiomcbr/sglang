@@ -59,10 +59,12 @@ def pynccl_allreduce(
 
 def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
     graph_input = inp_randn.clone()
+    graph_input_src = inp_randn.clone()  # static source to reset input each iteration
     with graph_capture() as graph_capture_context:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
             for _ in range(graph_loop):
+                graph_input.copy_(graph_input_src)
                 graph_out = func(graph_input)
 
     graph.replay()
