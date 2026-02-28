@@ -84,12 +84,19 @@ class PyMscclppCommunicator:
 
         for algo in algos:
             if algo.name == "default_allreduce_nvls_packet":
+                algo.set_message_size_range(0, 2 << 20)
                 navitve_algorithms_config.append(
                     (algo, [4, 8, 12, 16], [256, 512, 768, 1024])
                 )
             if algo.name == "default_allreduce_packet":
+                algo.set_message_size_range(0, 2 << 20)
                 navitve_algorithms_config.append(
                     (algo, [14, 21, 28, 42, 56], [256, 512, 768, 1024])
+                )
+            if algo.name == "default_allreduce_rsag_zero_copy":
+                algo.set_message_size_range(512 << 10, 4 << 30)
+                navitve_algorithms_config.append(
+                    (algo, [32, 48, 64, 128], [256, 512, 768, 1024])
                 )
 
         return navitve_algorithms_config
@@ -162,7 +169,7 @@ class PyMscclppCommunicator:
         return avg_time
 
     def _tune(self, n_warmup, n_graph_launches, n_ops_per_graph, algos_config):
-        sizes = [1 << i for i in range(9, 22)]
+        sizes = [1 << i for i in range(9, 24)]
         dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(
             data_type=str(torch.float16)
         )
