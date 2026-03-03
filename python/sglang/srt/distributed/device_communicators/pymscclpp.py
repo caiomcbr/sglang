@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,12 @@ logger = logging.getLogger(__name__)
 class PyMscclppCommunicator:
     _SUPPORTED_WORLD_SIZES = [8, 16]
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
+
+    def _is_symm_mem_enabled(self) -> bool:
+        try:
+            return get_global_server_args().enable_symm_mem
+        except ValueError:
+            return False
 
     def _is_weak_contiguous(self, inp: torch.Tensor):
         return inp.is_contiguous() or (
@@ -91,6 +98,11 @@ class PyMscclppCommunicator:
                 algo.set_message_size_range(512 << 10, 4 << 30)
                 navitve_algorithms_config.append(
                     (algo, [32, 48, 64, 128], [256, 512, 768, 1024])
+                )
+            if self.symm_mem_enabled and algo.name == "default_allreduce_nvls_zero_copy":
+                algo.set_message_size_range(512 << 10, 4 << 30)
+                navitve_algorithms_config.append(
+                    (algo, [4, 8, 12, 16, 32], [256, 512, 768, 1024])
                 )
 
         return navitve_algorithms_config
@@ -213,6 +225,7 @@ class PyMscclppCommunicator:
             stream=torch.cuda.current_stream().cuda_stream,
             nblocks=nblocks,
             nthreads_per_block=nthreads,
+            symmetric_memory=self.symm_mem_enabled,
         )
 
     def __init__(
@@ -290,6 +303,7 @@ class PyMscclppCommunicator:
             torch_group=self.group, rank=rank, size=world_size
         )
         self.executor = self.mscclpp.Executor(self.comm.communicator)
+        self.symm_mem_enabled = self._is_symm_mem_enabled()
         self.best_configs = {}
         self._create_algorithms()
 
