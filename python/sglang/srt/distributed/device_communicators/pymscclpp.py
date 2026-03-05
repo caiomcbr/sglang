@@ -200,6 +200,7 @@ class PyMscclppCommunicator:
                 ):
                     for nb in candidates_nblocks:
                         for nt in candidates_nthreads:
+                            logger.info(f"Testing algo {algo.name} in tune process with size {size} bytes, nblocks={nb}, nthreads={nt}")
                             avg_time = self._get_time(
                                 algo,
                                 tune_tensor,
