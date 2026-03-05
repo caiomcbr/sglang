@@ -221,6 +221,10 @@ class PyMscclppCommunicator:
             algo.reset()
 
     def _run_algo(self, algo, tensor, size, nblocks, nthreads):
+        if self.rank == 0:
+            if (algo.name, nblocks, nthreads, size) not in self.calls:
+                self.calls[(algo.name, nblocks, nthreads, size)] = 0
+            self.calls[(algo.name, nblocks, nthreads, size)] += 1
         return algo.execute(
             comm=self.comm.communicator,
             executor=self.executor,
@@ -262,6 +266,7 @@ class PyMscclppCommunicator:
             self.mscclpp = None
             return
 
+        self.calls = {}
         self.available = True
         self.group = group
 
@@ -326,6 +331,16 @@ class PyMscclppCommunicator:
             )
 
     def destroy(self):
+        for algo, count in self.calls.items():
+            if self.rank == 0:
+                logger.info(
+                    "Algo %s with nblocks=%d, nthreads=%d, size=%d bytes is called %d times",
+                    algo[0],
+                    algo[1],
+                    algo[2],
+                    algo[3],
+                    count,
+                )
         self.best_configs = None
         self.executor = None
         self.scratch_buffer = None
