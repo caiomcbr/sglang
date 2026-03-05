@@ -133,25 +133,25 @@ class PyMscclppCommunicator:
         n_ops_per_graph,
     ):
         # Check if the algorithm can run with the given configuration
-        if self._run_algo(algo, tune_tensor, size, nb, nt) != 0:
+        if self._run_algo(algo, tune_tensor, size, nb, nt, True) != 0:
             return float("inf")
 
         # Warmup iterations to stabilize performance
         for _ in range(n_warmup):
-            self._run_algo(algo, tune_tensor, size, nb, nt)
+            self._run_algo(algo, tune_tensor, size, nb, nt, True)
 
         # Warmup on capture stream
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
-            self._run_algo(algo, tune_tensor, size, nb, nt)
+            self._run_algo(algo, tune_tensor, size, nb, nt, True)
         capture_stream.synchronize()
 
         # Capture the algorithm execution in a CUDA graph
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, stream=capture_stream):
             for _ in range(n_ops_per_graph):
-                self._run_algo(algo, tune_tensor, size, nb, nt)
+                self._run_algo(algo, tune_tensor, size, nb, nt, True)
 
         # Measure the execution time of the captured graph
         start_event = torch.cuda.Event(enable_timing=True)
@@ -221,7 +221,7 @@ class PyMscclppCommunicator:
         for algo, _, _ in algos_config:
             algo.reset()
 
-    def _run_algo(self, algo, tensor, size, nblocks, nthreads):
+    def _run_algo(self, algo, tensor, size, nblocks, nthreads, sym_mem_enabled=False):
         if self.rank == 0:
             if (algo.name, nblocks, nthreads, size) not in self.calls:
                 self.calls[(algo.name, nblocks, nthreads, size)] = 0
@@ -238,7 +238,7 @@ class PyMscclppCommunicator:
             stream=torch.cuda.current_stream().cuda_stream,
             nblocks=nblocks,
             nthreads_per_block=nthreads,
-            symmetric_memory=self.symm_mem_enabled,
+            symmetric_memory=sym_mem_enabled,
         )
 
     def __init__(
@@ -390,7 +390,7 @@ class PyMscclppCommunicator:
         assert op == torch.distributed.ReduceOp.SUM
         nbytes = tensor.numel() * tensor.element_size()
         algo, nblocks, nthreads = self._get_tuned_config(nbytes)
-        self._run_algo(algo, tensor, nbytes, nblocks, nthreads)
+        self._run_algo(algo, tensor, nbytes, nblocks, nthreads, self.symm_mem_enabled)
         return tensor
 
     @contextmanager
