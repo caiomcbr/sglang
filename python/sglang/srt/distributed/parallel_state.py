@@ -603,7 +603,7 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled() and (self.pymscclpp_comm is None or self.pymscclpp_comm.should_mscclpp_allreduce(input_)):
+        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled() and (self.pymscclpp_comm is None or not self.pymscclpp_comm.should_mscclpp_allreduce(input_)):
             with self.pynccl_comm.change_state(
                 enable=True, stream=get_current_device_stream_fast()
             ):
@@ -613,7 +613,7 @@ class GroupCoordinator:
         outplace_all_reduce_method = None
         if (
             self.ca_comm is not None
-            and (self.pymscclpp_comm is None or self.pymscclpp_comm.should_mscclpp_allreduce(input_))
+            and (self.pymscclpp_comm is None or not self.pymscclpp_comm.should_mscclpp_allreduce(input_))
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         ):
