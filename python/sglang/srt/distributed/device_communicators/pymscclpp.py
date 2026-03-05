@@ -311,6 +311,8 @@ class PyMscclppCommunicator:
         self.device = device
 
         self.rank = rank
+        if self.rank == 0:
+            logger.info(f"Initializing PyMscclppCommunicator on version {self.mscclpp.__version__}")
         self.world_size = world_size
         self.comm = self.mscclpp.CommGroup(
             torch_group=self.group, rank=rank, size=world_size
@@ -319,6 +321,7 @@ class PyMscclppCommunicator:
         self.symm_mem_enabled = self._is_symm_mem_enabled()
         self.best_configs = {}
         self._create_algorithms()
+        self.calls = {}
 
         for size, (algo, nb, nt) in self.best_configs.items():
             if self.rank == 0:
