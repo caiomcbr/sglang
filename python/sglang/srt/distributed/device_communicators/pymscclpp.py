@@ -91,7 +91,7 @@ class PyMscclppCommunicator:
 
         for algo in algos:
             if algo.name == "default_allreduce_nvls_packet":
-                algo.set_message_size_range(0, 2 << 20)
+                algo.set_message_size_range(0, 512 << 10)
                 navitve_algorithms_config.append(
                     (algo, [4, 8, 12, 16], [256, 512, 768, 1024])
                 )
@@ -185,6 +185,8 @@ class PyMscclppCommunicator:
         dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(
             data_type=str(torch.float16)
         )
+        if self.rank == 0:
+            logger.info("Tunning MSCCL++ for sizes from %d to %d bytes", sizes[0], sizes[-1])
         tune_tensor = torch.utils.dlpack.from_dlpack(dlpack)
 
         for size in sizes:
@@ -312,6 +314,16 @@ class PyMscclppCommunicator:
         self.symm_mem_enabled = self._is_symm_mem_enabled()
         self.best_configs = {}
         self._create_algorithms()
+
+        for size, (algo, nb, nt) in self.best_configs.items():
+            if self.rank == 0:
+                logger.info(
+                    "Best config for size %d bytes: algo=%s, nblocks=%d, nthreads=%d",
+                    size,
+                    algo.name,
+                    nb,
+                    nt,
+            )
 
     def destroy(self):
         self.best_configs = None
